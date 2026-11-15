@@ -123,6 +123,40 @@ func (t *Tx) UpdateTask(task *models.Task) (err error) {
 	return nil
 }
 
+// UpdateTaskIfStatus 仅当数据库中任务当前状态属于 expectStatuses 时才写入 task，
+// 实现状态迁移的 CAS 语义，避免取消标记被后续的 RUNNING 写入覆盖。
+// updated 为 false 表示当前状态不满足条件、本次未写入。
+func (t *Tx) UpdateTaskIfStatus(task *models.Task, expectStatuses ...constants.TaskStatus) (updated bool, err error) {
+	b := t.tx.Bucket([]byte(constants.TaskBucket))
+	if b == nil {
+		return false, nil
+	}
+	current := b.Get([]byte(task.Id.String()))
+	if len(current) == 0 {
+		return false, nil
+	}
+	var currentTask models.Task
+	if err = json.Unmarshal(current, &currentTask); err != nil {
+		return false, err
+	}
+	matched := false
+	for _, status := range expectStatuses {
+		if currentTask.Status == status {
+			matched = true
+			break
+		}
+	}
+	if !matched {
+		return false, nil
+	}
+	task.UpdateTs = time.Now()
+	value, _ := json.Marshal(&task)
+	if err = b.Put([]byte(task.Id.String()), value); err != nil {
+		return false, err
+	}
+	return true, nil
+}
+
 // 通过 ID 删除任务
 func (t *Tx) DeleteTask(id uuid.UUID) (err error) {
 	b := t.tx.Bucket([]byte(constants.TaskBucket))

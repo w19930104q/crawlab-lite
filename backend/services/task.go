@@ -1,7 +1,6 @@
 package services
 
 import (
-	"crawlab-lite/constants"
 	"crawlab-lite/dao"
 	"crawlab-lite/database"
 	"crawlab-lite/forms"
@@ -166,20 +165,22 @@ func RemoveTask(id uuid.UUID) (res interface{}, err error) {
 		if task == nil {
 			return errors.New("task not found")
 		}
-		// 取消任务
-		managers.SetTaskCancelled(task)
+		return nil
+	}); err != nil {
+		return nil, err
+	}
 
-		// 删除任务
+	// 先取消仍在执行的任务并等待进程收口，再删除记录
+	if _, err = managers.CancelTask(id.String()); err != nil {
+		return nil, err
+	}
+
+	if err := dao.WriteTx(database.MainDB, func(tx dao.Tx) error {
 		if err = tx.DeleteTask(id); err != nil {
 			return err
 		}
-
 		if err := dao.WriteTx(database.LogDB, func(tx2 dao.Tx) error {
-			// 删除日志
-			if err = tx2.DeleteAllTaskLogs(id); err != nil {
-				return err
-			}
-			return nil
+			return tx2.DeleteAllTaskLogs(id)
 		}); err != nil {
 			return err
 		}
@@ -192,7 +193,13 @@ func RemoveTask(id uuid.UUID) (res interface{}, err error) {
 }
 
 func CancelTask(id uuid.UUID) (result *results.Task, err error) {
-	if err := dao.WriteTx(database.MainDB, func(tx dao.Tx) error {
+	// 取消排队/执行中的任务；重复取消与终态任务幂等返回
+	if _, err = managers.CancelTask(id.String()); err != nil {
+		return nil, err
+	}
+
+	// 回读最新任务记录返回，保证 API 响应与 BoltDB 终态一致
+	if err = dao.ReadTx(database.MainDB, func(tx dao.Tx) error {
 		task, err := tx.SelectTask(id)
 		if err != nil {
 			return err
@@ -200,25 +207,17 @@ func CancelTask(id uuid.UUID) (result *results.Task, err error) {
 		if task == nil {
 			return errors.New("task not found")
 		}
-
-		if task.Status == constants.TaskStatusRunning ||
-			task.Status == constants.TaskStatusProcessing ||
-			task.Status == constants.TaskStatusPending {
-			managers.SetTaskCancelled(task)
-		} else {
-			return nil
-		}
-
-		task.Status = constants.TaskStatusCancelled
-		if err = tx.UpdateTask(task); err != nil {
-			return err
-		}
-
 		result = &results.Task{}
 		if err := copier.Copy(&result, task); err != nil {
 			return err
 		}
-
+		spider, err := tx.SelectSpider(task.SpiderId)
+		if err != nil {
+			return err
+		}
+		if spider != nil {
+			result.SpiderName = spider.Name
+		}
 		return nil
 	}); err != nil {
 		return nil, err
@@ -236,8 +235,21 @@ func RestartTask(id uuid.UUID) (result *results.Task, err error) {
 		if task == nil {
 			return errors.New("task not found")
 		}
+		return nil
+	}); err != nil {
+		return nil, err
+	}
 
-		managers.SetTaskCancelled(task)
+	// 旧任务若仍在执行，先取消并等待收口，避免两个任务同时占用同一进程归属
+	if _, err = managers.CancelTask(id.String()); err != nil {
+		return nil, err
+	}
+
+	if err := dao.WriteTx(database.MainDB, func(tx dao.Tx) error {
+		task, err := tx.SelectTask(id)
+		if err != nil {
+			return err
+		}
 
 		newTask := &models.Task{
 			SpiderId:        task.SpiderId,
